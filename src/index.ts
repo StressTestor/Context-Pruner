@@ -3,6 +3,7 @@ import { Type } from "@sinclair/typebox";
 import { resolveConfig, type ContextPrunerConfig } from "./config.js";
 import { pruneMessages, estimateTokens, importanceDistribution } from "./pruner.js";
 import { scoreMessage, type Message } from "./scorer.js";
+import { readFileSync } from "node:fs";
 
 let cfg: ContextPrunerConfig;
 
@@ -10,6 +11,61 @@ function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
+}
+
+// ── Module-scope cache for last known state ─────────────────────────
+// Populated by hooks so tools/commands can report stats without needing
+// direct message access (which the SDK doesn't provide).
+
+interface CachedState {
+  messages: Message[];
+  sessionFile?: string;
+  timestamp: number;
+}
+
+let lastState: CachedState | null = null;
+
+/**
+ * Parse a JSONL session file into Message[].
+ * Each line is a JSON object with at least { role, content? }.
+ * Lines that fail to parse are silently skipped.
+ */
+function readSessionMessages(sessionFile: string): Message[] {
+  try {
+    const raw = readFileSync(sessionFile, "utf-8");
+    const messages: Message[] = [];
+    for (const line of raw.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj && obj.role) {
+          messages.push(obj as Message);
+        }
+      } catch {
+        // skip malformed lines
+      }
+    }
+    return messages;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Get messages from the best available source:
+ * 1. Direct event data (if provided)
+ * 2. Session file (read from disk)
+ * 3. Cached state from last hook invocation
+ */
+function getMessages(eventMessages?: Message[], sessionFile?: string): Message[] {
+  if (eventMessages && eventMessages.length > 0) return eventMessages;
+  if (sessionFile) {
+    const msgs = readSessionMessages(sessionFile);
+    if (msgs.length > 0) return msgs;
+  }
+  if (lastState) return lastState.messages;
+  return [];
 }
 
 const plugin = {
@@ -30,7 +86,7 @@ const plugin = {
         description: "Show current context size, message count, estimated tokens, and importance distribution.",
         parameters: Type.Object({}),
         async execute(_toolCallId: string, _params: Record<string, unknown>) {
-          const messages: Message[] = api.getMessages?.() ?? [];
+          const messages = lastState?.messages ?? [];
           const count = messages.length;
           const tokens = estimateTokens(messages);
           const dist = importanceDistribution(messages);
@@ -40,6 +96,7 @@ const plugin = {
             `estimated tokens: ${formatTokens(tokens)}`,
             `threshold: ${cfg.maxMessages} (prune to ${cfg.targetMessages})`,
             `auto-prune: ${cfg.autoPrune ? "on" : "off"}`,
+            `data source: ${lastState ? "last hook snapshot" : "none (no data yet)"}`,
             "",
             "importance distribution:",
             `  critical (0.75-1.0): ${dist.critical}`,
@@ -50,12 +107,13 @@ const plugin = {
 
           if (count > cfg.maxMessages) {
             lines.push("", `status: over threshold by ${count - cfg.maxMessages} messages`);
-          } else {
+          } else if (count > 0) {
             lines.push("", `status: ${cfg.maxMessages - count} messages until auto-prune triggers`);
           }
 
           return {
             content: [{ type: "text" as const, text: lines.join("\n") }],
+            details: null,
           };
         },
       },
@@ -65,8 +123,8 @@ const plugin = {
     api.registerTool(
       {
         name: "context_prune",
-        label: "Prune Context",
-        description: "Manually trigger context pruning. Removes low-importance messages while preserving decisions, code, and recent context.",
+        label: "Prune Context (Dry Run)",
+        description: "Analyze what would be pruned from context. Reports removable messages by importance score. Actual pruning happens automatically via compaction hooks.",
         parameters: Type.Object({
           aggressiveness: Type.Optional(
             Type.Number({
@@ -78,11 +136,12 @@ const plugin = {
           ),
         }),
         async execute(_toolCallId: string, params: Record<string, unknown>) {
-          const messages: Message[] = api.getMessages?.() ?? [];
+          const messages = lastState?.messages ?? [];
 
           if (messages.length === 0) {
             return {
-              content: [{ type: "text" as const, text: "no messages to prune." }],
+              content: [{ type: "text" as const, text: "no message data available. stats populate after the first compaction or agent start event." }],
+              details: null,
             };
           }
 
@@ -97,26 +156,27 @@ const plugin = {
                   text: `nothing to prune. ${messages.length} messages, all within threshold.`,
                 },
               ],
+              details: null,
             };
           }
-
-          // Apply the pruned messages
-          api.setMessages?.(result.kept);
 
           const tokensBefore = estimateTokens(messages);
           const tokensAfter = estimateTokens(result.kept);
 
           const lines = [
-            `pruned ${result.removedCount} of ${result.originalCount} messages`,
-            `kept: ${result.kept.length}`,
-            `tokens: ${formatTokens(tokensBefore)} -> ${formatTokens(tokensAfter)} (saved ~${formatTokens(tokensBefore - tokensAfter)})`,
+            `would prune ${result.removedCount} of ${result.originalCount} messages`,
+            `would keep: ${result.kept.length}`,
+            `token estimate: ${formatTokens(tokensBefore)} -> ${formatTokens(tokensAfter)} (would save ~${formatTokens(tokensBefore - tokensAfter)})`,
             `removed score range: ${result.removedScores.min.toFixed(2)} - ${result.removedScores.max.toFixed(2)} (avg ${result.removedScores.avg.toFixed(2)})`,
+            "",
+            "note: actual pruning happens automatically during compaction via prependContext injection.",
           ];
 
-          api.logger.info(`context-pruner: removed ${result.removedCount} messages (${formatTokens(tokensBefore - tokensAfter)} tokens saved)`);
+          api.logger.info(`context-pruner: dry-run would remove ${result.removedCount} messages (${formatTokens(tokensBefore - tokensAfter)} tokens)`);
 
           return {
             content: [{ type: "text" as const, text: lines.join("\n") }],
+            details: null,
           };
         },
       },
@@ -125,23 +185,78 @@ const plugin = {
 
     // ── Hooks ─────────────────────────────────────────────────────────
 
-    api.on("before_agent_start", async (_event: any) => {
+    // before_agent_start: analyze messages and inject a prependContext summary
+    // if context is bloated, guiding the agent to request compaction.
+    api.on("before_agent_start", async (event: { prompt: string; messages?: Message[] }) => {
       try {
-        if (!cfg.autoPrune) return;
+        const messages = event.messages ?? [];
 
-        const messages: Message[] = api.getMessages?.() ?? [];
+        // Cache for tools/commands
+        lastState = { messages, timestamp: Date.now() };
+
+        if (!cfg.autoPrune) return;
         if (messages.length <= cfg.maxMessages) return;
 
+        // We can't mutate messages directly. Instead, inject a prependContext
+        // that summarizes the situation and tells the agent context is heavy.
         const result = pruneMessages(messages, cfg);
+        const tokensBefore = estimateTokens(messages);
+        const tokensAfter = estimateTokens(result.kept);
 
-        if (result.removedCount > 0) {
-          api.setMessages?.(result.kept);
+        const summary = [
+          `[context-pruner] context is at ${messages.length} messages (~${formatTokens(tokensBefore)} tokens), above threshold of ${cfg.maxMessages}.`,
+          `${result.removedCount} low-importance messages identified (score range: ${result.removedScores.min.toFixed(2)}-${result.removedScores.max.toFixed(2)}).`,
+          `potential savings: ~${formatTokens(tokensBefore - tokensAfter)} tokens.`,
+          `compaction recommended.`,
+        ].join(" ");
+
+        api.logger.info(`context-pruner: injecting prependContext (${messages.length} msgs over threshold)`);
+
+        return { prependContext: summary };
+      } catch (e: any) {
+        api.logger.warn(`context-pruner: before_agent_start failed: ${e.message}`);
+      }
+    });
+
+    // before_compaction: read-only analysis, cache state for tools
+    api.on("before_compaction", async (event: { messageCount: number; messages?: Message[]; sessionFile?: string }) => {
+      try {
+        const messages = getMessages(event.messages, event.sessionFile);
+        lastState = {
+          messages,
+          sessionFile: event.sessionFile,
+          timestamp: Date.now(),
+        };
+
+        if (messages.length > 0) {
+          const dist = importanceDistribution(messages);
           api.logger.info(
-            `context-pruner: auto-pruned ${result.removedCount} messages (${messages.length} -> ${result.kept.length})`,
+            `context-pruner: pre-compaction snapshot — ${messages.length} msgs, ` +
+            `${dist.low} low / ${dist.medium} med / ${dist.high} high / ${dist.critical} critical`,
           );
         }
       } catch (e: any) {
-        api.logger.warn(`context-pruner: auto-prune failed: ${e.message}`);
+        api.logger.warn(`context-pruner: before_compaction failed: ${e.message}`);
+      }
+    });
+
+    // tool_result_persist: slim down tool results before they're written to the session
+    api.on("tool_result_persist", async (event: { toolName: string; result: any }) => {
+      try {
+        // Trim excessively large tool outputs to save context space
+        if (event.result?.content && Array.isArray(event.result.content)) {
+          for (const part of event.result.content) {
+            if (part.type === "text" && typeof part.text === "string" && part.text.length > 5000) {
+              // Truncate very large tool outputs, keeping head and tail
+              const text = part.text;
+              const head = text.slice(0, 2000);
+              const tail = text.slice(-1000);
+              part.text = `${head}\n\n... [context-pruner: truncated ${formatTokens(Math.ceil((text.length - 3000) / 4))} tokens] ...\n\n${tail}`;
+            }
+          }
+        }
+      } catch (e: any) {
+        api.logger.warn(`context-pruner: tool_result_persist failed: ${e.message}`);
       }
     });
 
@@ -149,16 +264,16 @@ const plugin = {
 
     api.registerCommand({
       name: "prune",
-      description: "Quick manual context prune",
+      description: "Quick context analysis — shows what would be pruned",
       acceptsArgs: true,
-      handler: async (args?: string) => {
-        const messages: Message[] = api.getMessages?.() ?? [];
+      handler: async (ctx: { args?: string; channel: any; config: any; senderId?: string; isAuthorizedSender: boolean; commandBody: string }) => {
+        const messages = lastState?.messages ?? [];
 
         if (messages.length === 0) {
-          return { text: "no messages to prune." };
+          return { text: "no message data yet. stats populate after first agent start or compaction." };
         }
 
-        const aggressiveness = args ? parseFloat(args) || 1.0 : 1.0;
+        const aggressiveness = ctx.args ? parseFloat(ctx.args) || 1.0 : 1.0;
         const result = pruneMessages(messages, cfg, aggressiveness);
 
         if (result.removedCount === 0) {
@@ -167,13 +282,11 @@ const plugin = {
           };
         }
 
-        api.setMessages?.(result.kept);
-
         const tokensBefore = estimateTokens(messages);
         const tokensAfter = estimateTokens(result.kept);
 
         return {
-          text: `pruned ${result.removedCount} messages. ${result.kept.length} remaining. saved ~${formatTokens(tokensBefore - tokensAfter)} tokens.`,
+          text: `would prune ${result.removedCount} messages. ${result.kept.length} would remain. potential savings: ~${formatTokens(tokensBefore - tokensAfter)} tokens.`,
         };
       },
     });
@@ -186,9 +299,10 @@ const plugin = {
 
         ctx
           .command("stats")
-          .description("Show context stats for the active session")
-          .action(() => {
-            const messages: Message[] = api.getMessages?.() ?? [];
+          .description("Show context stats from a session file")
+          .argument("[session-file]", "Path to JSONL session file")
+          .action((sessionFile: string | undefined) => {
+            const messages = sessionFile ? readSessionMessages(sessionFile) : (lastState?.messages ?? []);
             const count = messages.length;
             const tokens = estimateTokens(messages);
             const dist = importanceDistribution(messages);
@@ -209,11 +323,11 @@ const plugin = {
 
         ctx
           .command("prune")
-          .description("Manually prune context")
+          .description("Dry-run prune analysis on a session file")
+          .argument("[session-file]", "Path to JSONL session file")
           .option("--aggressive <n>", "Aggressiveness (0.5-3.0)", "1.0")
-          .option("--dry-run", "Show what would be pruned without pruning")
-          .action((opts: any) => {
-            const messages: Message[] = api.getMessages?.() ?? [];
+          .action((sessionFile: string | undefined, opts: any) => {
+            const messages = sessionFile ? readSessionMessages(sessionFile) : (lastState?.messages ?? []);
 
             if (messages.length === 0) {
               console.log("No messages.");
@@ -228,26 +342,27 @@ const plugin = {
               return;
             }
 
-            if (opts.dryRun) {
-              console.log(`Would remove ${result.removedCount} of ${result.originalCount} messages`);
-              console.log(`Score range: ${result.removedScores.min.toFixed(2)} - ${result.removedScores.max.toFixed(2)}`);
-              return;
-            }
+            console.log(`Would remove ${result.removedCount} of ${result.originalCount} messages`);
+            console.log(`Score range: ${result.removedScores.min.toFixed(2)} - ${result.removedScores.max.toFixed(2)}`);
 
-            api.setMessages?.(result.kept);
             const tokensBefore = estimateTokens(messages);
             const tokensAfter = estimateTokens(result.kept);
-            console.log(`Pruned ${result.removedCount} messages. ${result.kept.length} remaining.`);
             console.log(`Tokens: ${formatTokens(tokensBefore)} -> ${formatTokens(tokensAfter)}`);
           });
 
         ctx
           .command("score")
-          .description("Score a specific message by index")
+          .description("Score a specific message by index from a session file")
           .argument("<index>", "Message index")
-          .action((index: string) => {
-            const messages: Message[] = api.getMessages?.() ?? [];
+          .argument("[session-file]", "Path to JSONL session file")
+          .action((index: string, sessionFile: string | undefined) => {
+            const messages = sessionFile ? readSessionMessages(sessionFile) : (lastState?.messages ?? []);
             const i = parseInt(index);
+
+            if (messages.length === 0) {
+              console.log("No messages available.");
+              return;
+            }
 
             if (i < 0 || i >= messages.length) {
               console.log(`Invalid index. Messages: 0-${messages.length - 1}`);
