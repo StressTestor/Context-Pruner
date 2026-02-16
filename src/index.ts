@@ -126,18 +126,22 @@ const plugin = {
     // ── Hooks ─────────────────────────────────────────────────────────
 
     api.on("before_agent_start", async (_event: any) => {
-      if (!cfg.autoPrune) return;
+      try {
+        if (!cfg.autoPrune) return;
 
-      const messages: Message[] = api.getMessages?.() ?? [];
-      if (messages.length <= cfg.maxMessages) return;
+        const messages: Message[] = api.getMessages?.() ?? [];
+        if (messages.length <= cfg.maxMessages) return;
 
-      const result = pruneMessages(messages, cfg);
+        const result = pruneMessages(messages, cfg);
 
-      if (result.removedCount > 0) {
-        api.setMessages?.(result.kept);
-        api.logger.info(
-          `context-pruner: auto-pruned ${result.removedCount} messages (${messages.length} -> ${result.kept.length})`,
-        );
+        if (result.removedCount > 0) {
+          api.setMessages?.(result.kept);
+          api.logger.info(
+            `context-pruner: auto-pruned ${result.removedCount} messages (${messages.length} -> ${result.kept.length})`,
+          );
+        }
+      } catch (e: any) {
+        api.logger.warn(`context-pruner: auto-prune failed: ${e.message}`);
       }
     });
 

@@ -31,8 +31,21 @@ interface ScoredMessage {
  * Build a set of indices that are "paired" — tool calls and their results
  * must be kept or removed together.
  */
-function buildToolPairs(messages: Message[]): Map<number, number> {
-  const pairs = new Map<number, number>();
+/**
+ * Build a map of paired indices. An assistant message with multiple tool_calls
+ * maps to a Set of all its tool result indices, and each result maps back to
+ * a Set containing the assistant index. This avoids the old bug where a single
+ * Map<number, number> would overwrite earlier pairings.
+ */
+function buildToolPairs(messages: Message[]): Map<number, Set<number>> {
+  const pairs = new Map<number, Set<number>>();
+
+  function link(a: number, b: number) {
+    if (!pairs.has(a)) pairs.set(a, new Set());
+    if (!pairs.has(b)) pairs.set(b, new Set());
+    pairs.get(a)!.add(b);
+    pairs.get(b)!.add(a);
+  }
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -48,8 +61,7 @@ function buildToolPairs(messages: Message[]): Map<number, number> {
             (tc: any) => tc.id === msg.tool_call_id,
           )
         ) {
-          pairs.set(i, j);
-          pairs.set(j, i);
+          link(i, j);
           break;
         }
       }
@@ -117,10 +129,16 @@ export function pruneMessages(
     };
   });
 
-  // Collect prunable messages sorted by score (lowest first)
+  // Collect prunable messages sorted by score (lowest first).
+  // Messages below minImportance are sorted to the front so they get pruned first.
   const prunable = scored
     .filter((s) => !s.protected)
-    .sort((a, b) => a.score - b.score);
+    .sort((a, b) => {
+      const aBelowMin = a.score < config.minImportance ? 0 : 1;
+      const bBelowMin = b.score < config.minImportance ? 0 : 1;
+      if (aBelowMin !== bBelowMin) return aBelowMin - bBelowMin;
+      return a.score - b.score;
+    });
 
   const toRemove = new Set<number>();
   const needToRemove = total - effectiveTarget;
@@ -131,15 +149,27 @@ export function pruneMessages(
     // Skip if already marked
     if (toRemove.has(candidate.index)) continue;
 
-    // If this message is part of a tool pair, remove both or neither
-    const pairedIdx = toolPairs.get(candidate.index);
-    if (pairedIdx !== undefined) {
-      const paired = scored[pairedIdx];
-      // Don't remove if the pair is protected
-      if (paired.protected) continue;
+    // If this message is part of a tool pair, remove all paired indices or skip
+    const pairedIndices = toolPairs.get(candidate.index);
+    if (pairedIndices !== undefined && pairedIndices.size > 0) {
+      // Don't remove if any paired message is protected
+      const anyProtected = [...pairedIndices].some((idx) => scored[idx].protected);
+      if (anyProtected) continue;
 
       toRemove.add(candidate.index);
-      toRemove.add(pairedIdx);
+      for (const idx of pairedIndices) {
+        toRemove.add(idx);
+        // Also remove anything paired to the paired index (transitive closure)
+        const transitive = toolPairs.get(idx);
+        if (transitive) {
+          for (const t of transitive) {
+            if (!scored[t].protected) toRemove.add(t);
+          }
+        }
+      }
+      // Pair removal may overshoot needToRemove by a few messages — that's
+      // acceptable since orphaned tool calls/results would be worse.
+      if (toRemove.size >= needToRemove) break;
     } else {
       toRemove.add(candidate.index);
     }
