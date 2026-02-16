@@ -1,0 +1,61 @@
+{
+  "id": "context-pruner",
+  "kind": "context",
+  "name": "Context Pruner",
+  "description": "intelligent conversation context compaction. scores messages by importance, auto-prunes when context gets long. keeps decisions, code, and preferences — drops greetings, acks, and repetitive tool output.",
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "maxMessages": {
+        "type": "number",
+        "default": 100,
+        "minimum": 20,
+        "description": "Trigger pruning when message count exceeds this"
+      },
+      "targetMessages": {
+        "type": "number",
+        "default": 60,
+        "minimum": 10,
+        "description": "Prune down to this many messages"
+      },
+      "minImportance": {
+        "type": "number",
+        "default": 0.3,
+        "minimum": 0,
+        "maximum": 1,
+        "description": "Messages scoring below this are always prunable"
+      },
+      "preserveRecent": {
+        "type": "number",
+        "default": 10,
+        "minimum": 1,
+        "description": "Always keep the last N messages"
+      },
+      "preserveFirst": {
+        "type": "number",
+        "default": 3,
+        "minimum": 1,
+        "description": "Always keep the first N messages (system prompt context)"
+      },
+      "autoPrune": {
+        "type": "boolean",
+        "default": true,
+        "description": "Automatically prune before each agent turn when over maxMessages"
+      }
+    }
+  },
+  "uiHints": {
+    "maxMessages": {
+      "label": "Max Messages",
+      "help": "Auto-prune triggers when conversation exceeds this count"
+    },
+    "targetMessages": {
+      "label": "Target Messages",
+      "help": "How many messages to keep after pruning"
+    },
+    "minImportance": {
+      "label": "Min Importance Score",
+      "help": "Messages below this score (0-1) are pruned first"
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "name": "context-pruner",
+  "version": "1.0.0",
+  "description": "smart context pruning for openclaw. keeps the important stuff, drops the fluff.",
+  "type": "module",
+  "main": "src/index.ts",
+  "openclaw": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.48"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.1.26"
+  },
+  "keywords": [
+    "openclaw",
+    "plugin",
+    "context",
+    "pruning",
+    "token-management"
+  ],
+  "license": "MIT"
+}
