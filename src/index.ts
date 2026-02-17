@@ -58,8 +58,8 @@ function readSessionMessages(sessionFile: string): Message[] {
  * 2. Session file (read from disk)
  * 3. Cached state from last hook invocation
  */
-function getMessages(eventMessages?: Message[], sessionFile?: string): Message[] {
-  if (eventMessages && eventMessages.length > 0) return eventMessages;
+function getMessages(eventMessages?: unknown[], sessionFile?: string): Message[] {
+  if (eventMessages && eventMessages.length > 0) return eventMessages as Message[];
   if (sessionFile) {
     const msgs = readSessionMessages(sessionFile);
     if (msgs.length > 0) return msgs;
@@ -187,9 +187,9 @@ const plugin = {
 
     // before_agent_start: analyze messages and inject a prependContext summary
     // if context is bloated, guiding the agent to request compaction.
-    api.on("before_agent_start", async (event: { prompt: string; messages?: Message[] }) => {
+    api.on("before_agent_start", async (event) => {
       try {
-        const messages = event.messages ?? [];
+        const messages = (event.messages ?? []) as Message[];
 
         // Cache for tools/commands
         lastState = { messages, timestamp: Date.now() };
@@ -219,7 +219,7 @@ const plugin = {
     });
 
     // before_compaction: read-only analysis, cache state for tools
-    api.on("before_compaction", async (event: { messageCount: number; messages?: Message[]; sessionFile?: string }) => {
+    api.on("before_compaction", async (event) => {
       try {
         const messages = getMessages(event.messages, event.sessionFile);
         lastState = {
@@ -241,19 +241,22 @@ const plugin = {
     });
 
     // tool_result_persist: slim down tool results before they're written to the session
-    api.on("tool_result_persist", async (event: { toolName: string; result: any }) => {
+    api.on("tool_result_persist", (event) => {
       try {
         // Trim excessively large tool outputs to save context space
-        if (event.result?.content && Array.isArray(event.result.content)) {
-          for (const part of event.result.content) {
+        const msg = event.message as any;
+        if (msg?.content && Array.isArray(msg.content)) {
+          let modified = false;
+          for (const part of msg.content) {
             if (part.type === "text" && typeof part.text === "string" && part.text.length > 5000) {
-              // Truncate very large tool outputs, keeping head and tail
               const text = part.text;
               const head = text.slice(0, 2000);
               const tail = text.slice(-1000);
               part.text = `${head}\n\n... [context-pruner: truncated ${formatTokens(Math.ceil((text.length - 3000) / 4))} tokens] ...\n\n${tail}`;
+              modified = true;
             }
           }
+          if (modified) return { message: msg };
         }
       } catch (e: any) {
         api.logger.warn(`context-pruner: tool_result_persist failed: ${e.message}`);
