@@ -241,7 +241,7 @@ const plugin = {
     });
 
     // tool_result_persist: slim down tool results before they're written to the session
-    api.on("tool_result_persist", (event) => {
+    api.on("tool_result_persist", async (event) => {
       try {
         // Trim excessively large tool outputs to save context space
         const msg = event.message as any;

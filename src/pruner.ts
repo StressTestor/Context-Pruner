@@ -187,16 +187,18 @@ export function pruneMessages(
     }
   }
 
-  const removedScores =
-    removedScoresArr.length > 0
-      ? {
-          min: Math.min(...removedScoresArr),
-          max: Math.max(...removedScoresArr),
-          avg:
-            removedScoresArr.reduce((a, b) => a + b, 0) /
-            removedScoresArr.length,
-        }
-      : { min: 0, max: 0, avg: 0 };
+  let removedScores = { min: 0, max: 0, avg: 0 };
+  if (removedScoresArr.length > 0) {
+    let min = removedScoresArr[0];
+    let max = removedScoresArr[0];
+    let sum = 0;
+    for (const s of removedScoresArr) {
+      if (s < min) min = s;
+      if (s > max) max = s;
+      sum += s;
+    }
+    removedScores = { min, max, avg: sum / removedScoresArr.length };
+  }
 
   return {
     kept,
